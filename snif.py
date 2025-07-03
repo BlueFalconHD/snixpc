@@ -4,9 +4,6 @@
 
 import lldb
 import json
-import threading
-
-lock = threading.Lock()
 
 def __lldb_init_module(debugger, internal_dict):
     debugger.HandleCommand('command script add -f snif.set_xpc_breakpoints snif')
@@ -21,14 +18,21 @@ def execute_command(command):
     else:
         return result.GetError()
 
+def safely_evaluate_expression(frame, expression) -> lldb.SBValue:
+    opts = lldb.SBExpressionOptions()
+    opts.SetLanguage(lldb.eLanguageTypeObjC)
+    opts.SetIgnoreBreakpoints(True)
+    result = frame.EvaluateExpression(expression, opts)
+    return result
+
 def serialize_xpc_message(frame, xpc_dict):
-    
+
     objc_code = f'''
     @import Foundation;
 
     typedef void* xpc_object_t;
     typedef const struct _xpc_type_s * xpc_type_t;
-    
+
     extern xpc_type_t xpc_get_type(xpc_object_t object);
     extern const char *xpc_string_get_string_ptr(xpc_object_t xstring);
     extern int64_t xpc_int64_get_value(xpc_object_t xint);
@@ -39,7 +43,7 @@ def serialize_xpc_message(frame, xpc_dict):
     extern size_t xpc_data_get_length(xpc_object_t xdata);
     extern bool xpc_dictionary_apply(xpc_object_t xdict, bool (^applier)(const char *key, xpc_object_t value));
     extern const char *xpc_copy_description(xpc_object_t object);
-    
+
     extern const struct _xpc_type_s _xpc_type_string;
     extern const struct _xpc_type_s _xpc_type_int64;
     extern const struct _xpc_type_s _xpc_type_uint64;
@@ -47,7 +51,7 @@ def serialize_xpc_message(frame, xpc_dict):
     extern const struct _xpc_type_s _xpc_type_double;
     extern const struct _xpc_type_s _xpc_type_data;
     extern const struct _xpc_type_s _xpc_type_array;
-    
+
     #define XPC_TYPE_STRING (&_xpc_type_string)
     #define XPC_TYPE_INT64 (&_xpc_type_int64)
     #define XPC_TYPE_UINT64 (&_xpc_type_uint64)
@@ -62,7 +66,7 @@ def serialize_xpc_message(frame, xpc_dict):
         xpc_dictionary_apply((xpc_object_t)xpc_obj, ^bool(const char *key, xpc_object_t value) {{
             NSString *keyStr = [NSString stringWithCString:key encoding:NSUTF8StringEncoding];
             xpc_type_t type = xpc_get_type(value);
-            
+
             if (type == XPC_TYPE_STRING) {{
                 result[keyStr] = [NSString stringWithCString:xpc_string_get_string_ptr(value) encoding:NSUTF8StringEncoding];
             }} else if (type == XPC_TYPE_INT64) {{
@@ -83,7 +87,7 @@ def serialize_xpc_message(frame, xpc_dict):
             }} else {{
                 result[keyStr] = @"Unknown type";
             }}
-            
+
             return true;
         }});
 
@@ -97,7 +101,20 @@ def serialize_xpc_message(frame, xpc_dict):
     error ? [error localizedDescription] : [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding]
     '''
 
-    result = execute_command(f'expression -l objc -O -- {objc_code}')
+    # Evaluate the Objective-C code in the current frame
+    result = safely_evaluate_expression(frame, objc_code)
+
+    print(result)
+
+    if not result:
+        return {"error": {"message": "Failed to evaluate XPC serialization code", "data": ""}}
+    if result.GetError().Fail():
+        return {"error": {"message": result.GetError().GetCString(), "data": ""}}
+    result = result.GetValue()
+    if not result:
+        return {"error": {"message": "No result from XPC serialization", "data": ""}}
+    if result.startswith("error:"):
+        return {"error": {"message": result, "data": ""}}
 
     # Parse the JSON string
     try:
@@ -122,9 +139,22 @@ def capture_xpc_event(frame, direction):
     const char *name = xpc_connection_get_name(conn);
     name ? [NSString stringWithUTF8String:name] : @"<null>";
     '''
-    connection_name = execute_command(f'expr -l objc -O -- {get_connection_name_expr}')
-    if connection_name:
-        connection_name = connection_name.strip('"').replace('\\"', '"')
+
+    # Safely evaluate the expression to get the connection name
+    connection_name = safely_evaluate_expression(frame, get_connection_name_expr)
+    if connection_name and connection_name.GetError().Success():
+        connection_name = connection_name.GetSummary()
+        if connection_name and connection_name.startswith('"') and connection_name.endswith('"'):
+            connection_name = connection_name[1:-1]  # Remove quotes
+    else:
+        connection_name = None
+        if connection_name:
+            print(f"Error getting connection name: {connection_name.GetError().GetCString()}")
+    if connection_name is None:
+        connection_name = "Unknown"
+    elif connection_name == "<null>":
+        connection_name = "None"
+
 
     # Get connection pid
     get_connection_pid_expr = f'''
@@ -135,7 +165,21 @@ def capture_xpc_event(frame, direction):
     xpc_connection_t conn = (xpc_connection_t){conn};
     (int)xpc_connection_get_pid(conn);
     '''
-    connection_pid = execute_command(f'expr -l objc -O -- {get_connection_pid_expr}')
+
+    # Safely evaluate the expression to get the connection PID
+    connection_pid = safely_evaluate_expression(frame, get_connection_pid_expr)
+    if connection_pid and connection_pid.GetError().Success():
+        connection_pid = connection_pid.GetValueAsSigned()
+    else:
+        connection_pid = None
+        if connection_pid:
+            print(f"Error getting connection PID: {connection_pid.GetError().GetCString()}")
+    if connection_pid is None:
+        connection_pid = "Unknown"
+    elif connection_pid == 0:
+        connection_pid = "Self"
+    else:
+        connection_pid = str(connection_pid)
 
     # Serialize the XPC message
     message = serialize_xpc_message(frame, msg)
@@ -150,28 +194,27 @@ def capture_xpc_event(frame, direction):
     }
 
     return json.dumps(xpc_data, indent=4)
-    
+
 
 def send_callback(frame, bp_loc, internal_dict):
-    lock.acquire()
+    bp = bp_loc.GetBreakpoint()
+    bp.SetEnabled(False)
     process = frame.GetThread().GetProcess()
-
     xpc_event = capture_xpc_event(frame, "send")
-    process.Continue()
+    # process.Continue()
 
     print(xpc_event)
-    lock.release()
     return False
 
 def recv_callback(frame, bp_loc, internal_dict):
-    lock.acquire()
+    bp = bp_loc.GetBreakpoint()
+    # bp.SetEnabled(False)
     process = frame.GetThread().GetProcess()
-
     xpc_event = capture_xpc_event(frame, "recv")
-    process.Continue()
+    # process.Continue()
 
     print(xpc_event)
-    lock.release()
+
     return False
 
 def set_xpc_breakpoints(debugger, command, result, internal_dict):
@@ -185,7 +228,7 @@ def set_xpc_breakpoints(debugger, command, result, internal_dict):
     for func in xpc_send_functions:
         breakpoint = target.BreakpointCreateByName(func)
         breakpoint.SetScriptCallbackFunction('snif.send_callback')
-        breakpoint.SetAutoContinue(False)
+        breakpoint.SetAutoContinue(True)
         print(f"Set breakpoint on: {func}")
 
     xpc_recv_functions = [
@@ -195,7 +238,7 @@ def set_xpc_breakpoints(debugger, command, result, internal_dict):
     for func in xpc_recv_functions:
         breakpoint = target.BreakpointCreateByName(func)
         breakpoint.SetScriptCallbackFunction('snif.recv_callback')
-        breakpoint.SetAutoContinue(False)
+        breakpoint.SetAutoContinue(True)
         print(f"Set breakpoint on: {func}")
 
     result.PutCString("Breakpoints set on XPC functions.")
